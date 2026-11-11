@@ -1,0 +1,151 @@
+import torch
+import torch.nn.functional as F
+import numpy as np
+from gt_sp.utils import get_batch, get_batch_blockize, get_seed_batch_size
+from gt_sp.initialize import (
+    get_sequence_parallel_world_size,
+    sequence_parallel_is_initialized,
+    set_last_batch_global_token_indices,
+)
+
+def calc_acc(y_true, y_pred):
+    acc_list = []
+    y_true = y_true.detach().cpu().numpy()
+    y_pred = y_pred.detach().cpu().numpy()
+    is_labeled = y_true[:] == y_true[:]
+    correct = y_true[is_labeled] == y_pred[is_labeled]
+    acc_list.append(float(np.sum(correct)) / len(correct))
+
+    return sum(acc_list) / len(acc_list)
+
+
+def _get_rest_split_sizes(idx_i, seq_parallel_world_size):
+    if idx_i.shape[0] >= 0:
+        x_dummy_list = [t for t in torch.tensor_split(
+            torch.zeros(idx_i.shape[0],), seq_parallel_world_size, dim=0
+        )]
+        return [t.shape[0] for t in x_dummy_list]
+    return None
+
+
+def _set_eval_last_batch_global_tokens(args, rest_split_sizes):
+    if rest_split_sizes is None:
+        return
+    seq_parallel_world_size = len(rest_split_sizes)
+    sub_real_seq_len = max(rest_split_sizes) + args.num_global_node
+    global_token_indices_last_batch = list(
+        range(0, seq_parallel_world_size * sub_real_seq_len, sub_real_seq_len)
+    )
+    set_last_batch_global_token_indices(global_token_indices_last_batch)
+
+
+@torch.no_grad()
+def eval(args, model, device, x, y, sub_idx, adjs):
+    """
+    Evaluate the model on valid/test subset of nodes on GPU.
+    If use this, model need to delete self.training.
+    TODO loss need allreduce if reuse sp forward pass
+    """
+    seq_parallel_world_size = get_sequence_parallel_world_size()
+    
+    y_true = []
+    y_pred = []
+    loss_list = []
+    model.eval()
+    
+    num_batch = sub_idx.size(0) // args.seq_len + 1
+    
+    if sub_idx.shape[0] % args.seq_len != 0:
+        x_dummy_list = [t for t in torch.tensor_split(
+            torch.randn(sub_idx.shape[0] % args.seq_len, ), seq_parallel_world_size, dim=0)]
+        rest_split_sizes = [t.shape[0] for t in x_dummy_list]
+        afterpad_split_sizes = [max(rest_split_sizes)] * seq_parallel_world_size
+        global_token_indices_last_batch = [afterpad_split_sizes[0]] + [sum(afterpad_split_sizes[:(i+1)]) + args.num_global_node*i for i in range(1, seq_parallel_world_size)]
+        set_last_batch_global_token_indices(global_token_indices_last_batch)
+
+    for i in range(num_batch):
+        idx_i = sub_idx[i*args.seq_len:(i+1)*args.seq_len]
+        
+        # subsequence data
+        x_i, y_i, attn_bias = get_batch(args, x, y, idx_i, adjs, rest_split_sizes, device)
+        
+        pred = model(x_i, attn_bias)
+        loss = F.nll_loss(pred, y_i)
+        loss_list.append(loss.item())
+        y_true.append(y_i.view(-1))
+        y_pred.append(pred.argmax(1))
+
+    y_pred = torch.cat(y_pred)
+    y_true = torch.cat(y_true)
+        
+    acc = calc_acc(y_true, y_pred)
+    
+    return acc, np.mean(loss_list)
+
+
+@torch.no_grad()
+def sparse_eval_gpu(args, model, x, y, sub_idx, attn_bias, edge_index, device):
+    """
+    Evaluate the model on train/valid/test subset of nodes in a batched way on GPU.
+    lager seq_len will be slower 
+    """
+    model.eval()
+
+    total = 0
+    correct = 0
+    N = x.shape[0]
+    force_gt_induced_eval = str(getattr(args, "model", "")).lower() == "gt"
+    seq_parallel_world_size = (
+        get_sequence_parallel_world_size() if sequence_parallel_is_initialized() else 1
+    )
+    
+    # num_batch = sub_idx.size(0) // args.seq_len + 1
+    # seq_len = 128
+    if force_gt_induced_eval:
+        eval_batch_size = args.seq_len
+    else:
+        eval_batch_size = get_seed_batch_size(args) if getattr(args, "batch_subgraph_mode", "induced") == "seed_rw" else args.seq_len
+    num_batch = (sub_idx.size(0) + eval_batch_size - 1) // eval_batch_size
+    
+    
+    # for i in tqdm(range(num_batch), desc="Iteration"):
+    for i in range(num_batch):
+        idx_i = sub_idx[i*eval_batch_size:(i+1)*eval_batch_size]
+        rest_split_sizes = None
+        if getattr(args, "batch_subgraph_mode", "induced") != "seed_rw" and idx_i.shape[0] < args.seq_len:
+            rest_split_sizes = _get_rest_split_sizes(idx_i, seq_parallel_world_size)
+            _set_eval_last_batch_global_tokens(args, rest_split_sizes)
+
+        x_i, y_i, edge_index_i, batch_attn_bias = get_batch_blockize(
+            args,
+            x,
+            y,
+            idx_i,
+            rest_split_sizes,
+            edge_index,
+            N,
+            device=device,
+            force_induced_edges=force_gt_induced_eval,
+        )
+
+        x_i, y_i = x_i.to(device), y_i.to(device)
+        if isinstance(edge_index_i, list):
+            edge_index_i = [e.to(device) for e in edge_index_i]
+        else:
+            edge_index_i = edge_index_i.to(device)
+
+        model_attn_bias = batch_attn_bias if batch_attn_bias is not None else attn_bias
+        pred = model(x_i, model_attn_bias, edge_index_i, attn_type=args.attn_type)
+        pred_label = pred.argmax(1)
+        y_i_flat = y_i.view(-1)
+        is_labeled = y_i_flat != -100
+        if is_labeled.any():
+            correct += int((pred_label[is_labeled] == y_i_flat[is_labeled]).sum().item())
+            total += int(is_labeled.sum().item())
+    acc = float(correct) / max(1, total)
+    
+    del x_i, y_i, edge_index_i
+    
+    return acc  
+
+
